@@ -15,10 +15,15 @@ mapping:
     b_gyr_cov: 0.0001
     fov_degree:    180
     det_range:     100.0
-    extrinsic_T: [ 0, 0, 0.28]
-    extrinsic_R: [ 1, 0, 0, 
-                   0, 1, 0, 
-                   0, 0, 1]
+#            extrinsic_T: [ 0, 0, 0.28]
+#            extrinsic_R: [ 1, 0, 0, 
+#                            0, 1, 0, 
+#                            0, 0, 1]
+
+    extrinsic_T: [-0.026102, 0.038266, -0.297789]
+    extrinsic_R: [0.999610,0.027142,0.006595,
+                    0.027188,-0.999606,-0.006972,
+                    0.006403,0.007149,-0.999954]
 
 publish:     
     scan_publish_en:  true       # 'false' will close all the point cloud output

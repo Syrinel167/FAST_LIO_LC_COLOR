@@ -1,6 +1,7 @@
 common:
     lid_topic:  "/velodyne_points"
     imu_topic:  "/imu/data"
+    camera_topic: "/camera/color/image_raw"
     keyFrame_topic: "/aft_pgo_path"
     keyFrame_id_topic: "/key_frames_ids"
     time_sync_en: true         # ONLY turn on when external time synchronization is really not possible
@@ -10,6 +11,17 @@ preprocess:
     scan_line: 16
     blind: 1                     # blind是min_radius^2
 
+color_mapping:
+    K_camera: [897.2655639648438, 0.0, 667.4661254882813,
+               0.0, 897.6438598632813, 383.1944580078125,
+               0.0, 0.0, 1.0]
+    D_camera: [0.16910859942436218, -0.5095232725143433, -0.0025386682245880365, 0.0001707322953734547, 0.4606553614139557]
+    time_offset_lidar_to_camera: 0.0                # ms
+    extrinsic_T: [0.06760859628425592, -0.0007961934446430777, -0.06867792485862072]          # lidar to camera
+    extrinsic_R: [0.0378944,   0.00118166,     0.999281,
+                  -0.998785,   -0.0314839,    0.0379129,
+                  0.0315061,    -0.999504,  -1.28427e-05]
+
 mapping:
     acc_cov: 0.1
     gyr_cov: 0.1
@@ -17,11 +29,16 @@ mapping:
     b_gyr_cov: 0.0001
     fov_degree:    180
     det_range:     100.0
-    extrinsic_T: [ 0, 0, 0.28]
-    extrinsic_R: [ 1, 0, 0, 
-                   0, 1, 0, 
-                   0, 0, 1]
+#            extrinsic_T: [ 0, 0, 0.28]
+#            extrinsic_R: [ 1, 0, 0, 
+#                            0, 1, 0, 
+#                            0, 0, 1]
 
+
+    extrinsic_T: [-0.026102, 0.038266, -0.297789]
+    extrinsic_R: [0.999610,0.027142,0.006595,
+                    0.027188,-0.999606,-0.006972,
+                    0.006403,0.007149,-0.999954]
 publish:     
     scan_publish_en:  true       # 'false' will close all the point cloud output
     dense_publish_en: ture       # false will low down the points number in a global-frame point clouds scan.

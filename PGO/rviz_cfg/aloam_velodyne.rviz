@@ -691,7 +691,7 @@ Visualization Manager:
         Z: 6.0498809814453125
       Focal Shape Fixed Size: false
       Focal Shape Size: 0.05000000074505806
-      Invert Z Axis: false
+      Invert Z Axis: true
       Name: Current View
       Near Clip Distance: 0.009999999776482582
       Pitch: 1.3347965478897095

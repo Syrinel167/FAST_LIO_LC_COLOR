@@ -75,6 +75,10 @@
 #include <map>
 #include <unordered_map>
 
+// opencv
+#include <opencv2/opencv.hpp>
+#include <cv_bridge/cv_bridge.h>
+
 #define INIT_TIME           (0.1)
 #define LASER_POINT_COV     (0.001)
 #define MAXN                (720000)
@@ -96,7 +100,7 @@ mutex mtx_buffer;
 condition_variable sig_buffer;
 
 string root_dir = ROOT_DIR;
-string map_file_path, lid_topic, imu_topic, keyFrame_topic, keyFrame_id_topic;
+string map_file_path, lid_topic, imu_topic, camera_topic, keyFrame_topic, keyFrame_id_topic;
 
 double res_mean_last = 0.05, total_residual = 0.0;
 double last_timestamp_lidar = 0, last_timestamp_imu = -1.0;
@@ -112,6 +116,7 @@ bool    recontructKdTree = false;
 bool    updateState = false;
 int     updateFrequency = 100;
 
+bool   camera_pushed = false;
 // visualize
 bool visulize_map = false;
 
@@ -123,6 +128,15 @@ vector<double>       extrinR(9, 0.0);
 deque<double>                     time_buffer;
 deque<PointCloudXYZI::Ptr>        lidar_buffer;
 deque<sensor_msgs::Imu::ConstPtr> imu_buffer;
+deque<sensor_msgs::ImagePtr>      camera_buffer;
+deque<double>                     camera_time_buffer;
+
+// color mapping param
+vector<double>       extrinT_lc(3, 0.0);
+vector<double>       extrinR_lc(9, 0.0);
+vector<double>       K_camera(9, 0.0);
+vector<double>       D_camera(5, 0.0);
+double               time_offset_lidar_camera = 0.0;
 
 PointCloudXYZI::Ptr featsFromMap(new PointCloudXYZI());
 PointCloudXYZI::Ptr feats_undistort(new PointCloudXYZI());
@@ -144,10 +158,15 @@ V3D euler_cur;
 V3D position_last(Zero3d);
 V3D Lidar_T_wrt_IMU(Zero3d);
 M3D Lidar_R_wrt_IMU(Eye3d);
+V3D Camera_T_wrt_Lidar(Zero3d);
+M3D Camera_R_wrt_Lidar(Eye3d);
+
 
 /*** EKF inputs and output ***/
 MeasureGroup Measures;
 esekfom::esekf<state_ikfom, 12, input_ikfom> kf;
+esekfom::esekf<state_ikfom, 12, input_ikfom> kf_camera;
+
 state_ikfom state_point;
 vect3 pos_lid;
 
@@ -414,6 +433,39 @@ void keyFrame_id_cbk(const std_msgs::Header::ConstPtr &msg_keyframe_id){
     idKeyFramesBuff.push(msg_keyframe_id->seq);
 }
 
+
+bool find_best_camera_match(double lidar_time, int& best_id)
+{
+    if (camera_time_buffer.empty())
+        return false;
+    int left = 0;
+    int right = camera_time_buffer.size() - 1;
+    int middle = 0;
+    while (left < right)
+    {
+        middle = left + (right - left) / 2;
+        if (camera_time_buffer[middle] > lidar_time)
+        {
+            right = middle;
+        }
+        else if (camera_time_buffer[middle] < lidar_time)
+        {
+            left = middle + 1;
+        }
+        else
+        {
+            best_id = middle;
+            return true;
+        }
+    }
+    best_id = middle;
+    double max_time_diff = 100;
+    if (lidar_time - camera_time_buffer[best_id] > max_time_diff)
+        return false;
+    else
+        return true;
+}
+
 /*
  * 获得同步的lidar和imu数据
 */
@@ -435,6 +487,20 @@ bool sync_packages(MeasureGroup &meas)
         meas.lidar_beg_time = time_buffer.front();
         lidar_end_time = meas.lidar_beg_time + meas.lidar->points.back().curvature / double(1000);
         lidar_pushed = true;
+        
+        int camera_id = -1;
+
+        if (find_best_camera_match(lidar_end_time, camera_id))
+        {
+            meas.image = camera_buffer[camera_id];
+            meas.match_camera_time = meas.image->header.stamp.toSec();
+            for (int i = 0; i <= camera_id; i++)
+            {
+                camera_time_buffer.pop_front();
+                camera_buffer.pop_front();
+            }
+            camera_pushed = true;
+        }
     }
 
     if (last_timestamp_imu < lidar_end_time)
@@ -458,6 +524,21 @@ bool sync_packages(MeasureGroup &meas)
     lidar_pushed = false;
     return true;
 }
+
+void camera_cbk(const sensor_msgs::ImageConstPtr& msg)
+{
+    mtx_buffer.lock();
+    ros::Time msg_time = msg->header.stamp;
+    sensor_msgs::ImagePtr image_msg(new sensor_msgs::Image);
+    *image_msg = *msg;
+
+    image_msg->header.stamp = ros::Time().fromSec(msg_time.toSec() + time_offset_lidar_camera);
+    camera_buffer.push_back(image_msg);
+    camera_time_buffer.push_back(msg_time.toSec() + time_offset_lidar_camera);
+    mtx_buffer.unlock();
+    sig_buffer.notify_all();
+}
+
 
 int process_increments = 0;
 void map_incremental()
@@ -779,6 +860,86 @@ void h_share_model(state_ikfom &s, esekfom::dyn_share_datastruct<double> &ekfom_
     solve_time += omp_get_wtime() - solve_start_;
 }
 
+Eigen::Vector2d distort(Eigen::Vector2d point)
+{
+    double k1 = D_camera[0];
+    double k2 = D_camera[1];
+    double k3 = D_camera[4];
+    double p1 = D_camera[2];
+    double p2 = D_camera[3];
+
+    double x2 = point.x() * point.x();
+    double y2 = point.y() * point.y();
+
+    double r2 = x2 + y2;
+    double r4 = r2 * r2;
+    double r6 = r2 * r4;
+
+    double r_coeff = 1.0 + k1 * r2 + k2 * r4 + k3 * r6;
+    double t_coeff1 = 2.0 * point.x() * point.y();
+    double t_coeff2 = r2 + 2.0 * x2;
+    double t_coeff3 = r2 + 2.0 * y2;
+    double x = r_coeff * point.x() + p1 * t_coeff1 + p2 * t_coeff2;
+    double y = r_coeff * point.y() + p1 * t_coeff3 + p2 * t_coeff1;
+
+    return Eigen::Vector2d(x, y);
+
+}
+
+
+void generateColorMap(sensor_msgs::ImagePtr msg_rgb, Eigen::Isometry3d& camera_state, Eigen::Isometry3d& lidar_state,
+                      pcl::PointCloud<pcl::PointXYZINormal>::Ptr& pc,
+                      pcl::PointCloud<pcl::PointXYZRGB>::Ptr& pc_color)
+{
+    Eigen::Isometry3d T_cl = camera_state.inverse() * lidar_state;
+    Eigen::Matrix3d Rcl = T_cl.rotation();
+    Eigen::Vector3d tcl = T_cl.translation();
+    cv::Mat rgb = cv_bridge::toCvCopy(*msg_rgb, "bgr8")->image;
+
+    cv::Mat hsv;
+    cv::cvtColor(rgb, hsv, cv::COLOR_BGR2HSV);
+
+    // 调整饱和度和亮度
+    float saturation_scale = 1.5;  // 饱和度增加 50%
+    float brightness_scale = 1.5;  // 亮度增加 50%
+    for (int y = 0; y < hsv.rows; y++) {
+        for (int x = 0; x < hsv.cols; x++) {
+            hsv.at<cv::Vec3b>(y, x)[1] = cv::saturate_cast<uchar>(hsv.at<cv::Vec3b>(y, x)[1] * saturation_scale);
+            hsv.at<cv::Vec3b>(y, x)[2] = cv::saturate_cast<uchar>(hsv.at<cv::Vec3b>(y, x)[2] * brightness_scale);
+        }
+    }
+
+    // 转换回 BGR 色彩空间
+    cv::Mat adjusted_image;
+    cv::cvtColor(hsv, adjusted_image, cv::COLOR_HSV2BGR);
+    rgb = adjusted_image;
+
+    for (int i = 0; i < pc->points.size(); i++)
+    {
+        Eigen::Vector3d point_pc = {pc->points[i].x, pc->points[i].y, pc->points[i].z};
+        Eigen::Vector3d point_camera = Rcl * point_pc + tcl;
+        if (point_camera.z() > 0)
+        {
+            Eigen::Vector2d point_2d = (point_camera.head<2>() / point_camera.z()).eval();
+            Eigen::Vector2d point_2d_dis = distort(point_2d);
+            int u = static_cast<int>(K_camera[0] * point_2d_dis.x() + K_camera[2]);
+            int v = static_cast<int>(K_camera[4] * point_2d_dis.y() + K_camera[5]);
+            if (u >= 0 && u < rgb.cols && v >= 0 && v < rgb.rows)
+            {
+                pcl::PointXYZRGB point_rgb;
+                point_rgb.x = point_pc.x();
+                point_rgb.y = point_pc.y();
+                point_rgb.z = point_pc.z();
+                point_rgb.b = (rgb.at<cv::Vec3b>(v, u)[0]);
+                point_rgb.g = (rgb.at<cv::Vec3b>(v, u)[1]);
+                point_rgb.r = (rgb.at<cv::Vec3b>(v, u)[2]);
+                pc_color->push_back(point_rgb);
+            }
+        }
+
+    }
+}
+
 int main(int argc, char** argv)
 {
     ros::init(argc, argv, "laserMapping");
@@ -818,6 +979,13 @@ int main(int argc, char** argv)
     nh.param<bool>("pcd_save_enable", pcd_save_en, 0);
     nh.param<vector<double>>("mapping/extrinsic_T", extrinT, vector<double>());
     nh.param<vector<double>>("mapping/extrinsic_R", extrinR, vector<double>());
+    // color mapping param
+    nh.param<vector<double>>("color_mapping/extrinsic_T", extrinT_lc, vector<double>());
+    nh.param<vector<double>>("color_mapping/extrinsic_R", extrinR_lc, vector<double>());
+    nh.param<vector<double>>("color_mapping/K_camera", K_camera, vector<double>());
+    nh.param<vector<double>>("color_mapping/D_camera", D_camera, vector<double>());
+    nh.param<string>("common/camera_topic", camera_topic, "/camera/color/image_raw");
+    nh.param<double>("color_mapping/time_offset_lidar_to_camera", time_offset_lidar_camera, 0.0);
     cout<<"p_pre->lidar_type "<<p_pre->lidar_type<<endl;
 
     nh.param<bool>("visulize_map", visulize_map, false);
@@ -847,6 +1015,15 @@ int main(int argc, char** argv)
 
     Lidar_T_wrt_IMU<<VEC_FROM_ARRAY(extrinT);
     Lidar_R_wrt_IMU<<MAT_FROM_ARRAY(extrinR);
+    Camera_T_wrt_Lidar<<VEC_FROM_ARRAY(extrinT_lc);
+    Camera_R_wrt_Lidar<<MAT_FROM_ARRAY(extrinR_lc);
+    Eigen::Isometry3d T_IL = Eigen::Isometry3d::Identity();
+    Eigen::Isometry3d T_LC = Eigen::Isometry3d::Identity();
+    T_IL.translate(Lidar_T_wrt_IMU);
+    T_IL.rotate(Lidar_R_wrt_IMU);
+    T_LC.translate(Camera_T_wrt_Lidar);
+    T_LC.rotate(Camera_R_wrt_Lidar);
+
     p_imu->set_extrinsic(Lidar_T_wrt_IMU, Lidar_R_wrt_IMU);
     p_imu->set_gyr_cov(V3D(gyr_cov, gyr_cov, gyr_cov));
     p_imu->set_acc_cov(V3D(acc_cov, acc_cov, acc_cov));
@@ -876,6 +1053,7 @@ int main(int argc, char** argv)
         nh.subscribe(lid_topic, 200000, livox_pcl_cbk) : \
         nh.subscribe(lid_topic, 200000, standard_pcl_cbk);
     ros::Subscriber sub_imu = nh.subscribe(imu_topic, 200000, imu_cbk);
+    ros::Subscriber sub_image = nh.subscribe(camera_topic, 200000, camera_cbk);
     ros::Subscriber sub_keyframes = nh.subscribe(keyFrame_topic, 10, keyFrame_cbk);
     ros::Subscriber sub_keyframes_id = nh.subscribe(keyFrame_id_topic, 10, keyFrame_id_cbk);
     ros::Publisher pubLaserCloudFull = nh.advertise<sensor_msgs::PointCloud2>
@@ -896,6 +1074,8 @@ int main(int argc, char** argv)
             ("/path", 100000);
     ros::Publisher pubPath_updated          = nh.advertise<nav_msgs::Path>
             ("/path_updated", 100000);
+    ros::Publisher pubColorMap          = nh.advertise<sensor_msgs::PointCloud2>
+            ("/color_pc", 100000);
 //------------------------------------------------------------------------------------------------------
     signal(SIGINT, SigHandle);
     ros::Rate rate(5000);
@@ -1192,6 +1372,34 @@ int main(int argc, char** argv)
             t3 = omp_get_wtime();
             map_incremental();
             t5 = omp_get_wtime();
+
+            if (camera_pushed)
+            {
+                pcl::PointCloud<pcl::PointXYZRGB>::Ptr pc_color(new pcl::PointCloud<pcl::PointXYZRGB>);
+//                kf_camera.change_x(state_point_last);
+//                p_imu->GetCameraState(Measures, kf_camera);
+//                state_ikfom cameratime_state = kf_camera.get_x();
+                state_ikfom cameratime_state = kf.get_x();
+                Eigen::Isometry3d state_imu_camera_time = Eigen::Isometry3d::Identity();
+                state_imu_camera_time.translate(Eigen::Vector3d(cameratime_state.pos));
+                state_imu_camera_time.rotate(Eigen::Quaterniond(cameratime_state.rot));
+                Eigen::Isometry3d state_camera = state_imu_camera_time * T_IL * T_LC;
+                Eigen::Isometry3d state_imu = Eigen::Isometry3d::Identity();
+                state_imu.translate(Eigen::Vector3d(kf.get_x().pos));
+                state_imu.rotate(Eigen::Quaterniond(kf.get_x().rot));
+                Eigen::Isometry3d state_lidar = state_imu * T_IL;
+
+                generateColorMap(Measures.image, state_camera, state_lidar, feats_undistort, pc_color);
+                pcl::transformPointCloud(*pc_color, *pc_color, state_lidar.matrix());
+                sensor_msgs::PointCloud2 color_msg;
+                pcl::toROSMsg(*pc_color, color_msg);
+                color_msg.header.frame_id = "camera_init";
+                color_msg.header.stamp = ros::Time().fromSec(lidar_end_time);
+                pubColorMap.publish(color_msg);
+
+                camera_pushed = false;
+            }
+
 
             /******* Publish points *******/
             publish_path(pubPath);
